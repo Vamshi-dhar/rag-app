@@ -1,5 +1,4 @@
 qdrant-client
 pymupdf
-sentence-transformers
 openai
 python-dotenv

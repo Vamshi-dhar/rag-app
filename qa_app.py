@@ -1,31 +1,61 @@
 """
 RAG Q&A Application - Interactive question answering from NCERT Physics PDF
 """
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from qdrant_client import QdrantClient
-import openai
 import os
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Initialize models
-print("Loading models...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Connect to Qdrant
+# Connect to Qdrant using environment variables
 qdrant_client = QdrantClient(
-    url="https://6e8b2b56-7e71-4cb3-8a1d-fd6149e731c3.eu-west-1-0.aws.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YzhlNmE0MDAtZTkxOC00MTFhLTlhMjQtMWNmOWYxODVhYTkzIn0.hFbR62CvPdrm79UKvfgZCB-QnLpBgMYs7SH9i8xCccE",
+    url=os.getenv("QDRANT_URL"),
+    api_key=os.getenv("QDRANT_API_KEY"),
 )
 
 COLLECTION_NAME = "ncert_physics_class11"
 
-def retrieve_relevant_chunks(question, top_k=3):
-    """Retrieve most relevant chunks from Qdrant"""
-    # Generate embedding for the question
-    question_embedding = embedding_model.encode(question).tolist()
+print("✓ Loaded configuration from environment variables")
+
+def get_embedding(text):
+    """Generate embedding using OpenAI"""
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return response.data[0].embedding
+
+def expand_query(question):
+    """Expand the query for better retrieval using LLM"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a search query expander. Generate additional keywords and phrases that would help find relevant physics content."},
+                {"role": "user", "content": f"Original query: {question}\n\nGenerate 3-5 related keywords or short phrases that would help retrieve relevant content about this topic from a physics textbook. Return only the keywords separated by commas."}
+            ],
+            temperature=0.3,
+            max_tokens=50
+        )
+        keywords = response.choices[0].message.content.strip()
+        expanded = f"{question} {keywords}"
+        return expanded
+    except:
+        return question
+
+def retrieve_relevant_chunks(question, top_k=5):
+    """Retrieve most relevant chunks from Qdrant with query expansion"""
+    # Expand the query for better retrieval
+    expanded_query = expand_query(question)
+    print(f"   Expanded query: {expanded_query[:100]}...")
+    
+    # Generate embedding for the expanded question using OpenAI
+    question_embedding = get_embedding(expanded_query)
     
     # Search in Qdrant - try different methods based on client version
     try:
@@ -53,112 +83,107 @@ def retrieve_relevant_chunks(question, top_k=3):
             )
             return results
 
-def generate_answer_local(question, context_chunks):
-    """Generate answer using local context (without LLM)"""
-    if not context_chunks:
-        return "No relevant information found."
-    
-    # Simple extraction-based answer
+def generate_answer_with_llm(question, context_chunks):
+    """Generate answer using OpenAI with RAG context"""
+    # Prepare context from retrieved chunks with scores
     context_parts = []
-    for chunk in context_chunks:
-        # Handle different response structures
+    for idx, chunk in enumerate(context_chunks, 1):
         if hasattr(chunk, 'payload'):
             page = chunk.payload.get('page_number', 'Unknown')
             text = chunk.payload.get('text', '')
+            score = getattr(chunk, 'score', 0)
         else:
             page = chunk.get('page_number', 'Unknown')
             text = chunk.get('text', '')
+            score = chunk.get('score', 0)
         
-        context_parts.append(f"[Page {page}]: {text}")
+        context_parts.append(f"[Passage {idx} - Page {page}, Relevance: {score:.2f}]:\n{text}")
     
-    return "\n\n".join(context_parts)
+    context_text = "\n\n".join(context_parts)
+    
+    # Create prompt for GPT
+    prompt = f"""You are a helpful physics tutor. Based on the following excerpts from NCERT Class 11 Physics textbook, answer the student's question clearly and comprehensively.
 
-def generate_answer_with_llm(question, context_chunks):
-    """Generate answer using OpenAI (optional - requires API key)"""
-    try:
-        # Check if OpenAI API key is set
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            return None
-        
-        openai.api_key = openai_api_key
-        
-        # Prepare context - handle different structures
-        context_parts = []
-        for chunk in context_chunks:
-            if hasattr(chunk, 'payload'):
-                page = chunk.payload.get('page_number', 'Unknown')
-                text = chunk.payload.get('text', '')
-            else:
-                page = chunk.get('page_number', 'Unknown')
-                text = chunk.get('text', '')
-            context_parts.append(f"[Page {page}]: {text}")
-        
-        context_text = "\n\n".join(context_parts)
-        
-        # Create prompt
-        prompt = f"""Based on the following context from NCERT Class 11 Physics textbook, answer the question.
-
-Context:
+Context from Textbook (multiple passages):
 {context_text}
 
-Question: {question}
+Student's Question: {question}
 
-Answer: Provide a clear and concise answer based only on the context provided. If the context doesn't contain enough information, say so."""
-        
-        # Call OpenAI API
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful physics tutor answering questions based on NCERT Class 11 Physics textbook."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-        
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Note: OpenAI error - {e}")
-        return None
+Instructions:
+- Provide a complete, accurate answer based on the context
+- If the context contains definitions, laws, or formulas, include them clearly
+- Explain concepts in simple, educational terms
+- Use bullet points or numbered lists for clarity when appropriate
+- If multiple passages discuss the topic, synthesize the information
+- If the context doesn't fully answer the question, mention what information is available and what might be missing
+- Always cite page numbers when referencing specific information
+
+Answer:"""
+    
+    # Call OpenAI API
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a knowledgeable and helpful physics tutor specializing in NCERT Class 11 Physics. You provide clear, comprehensive answers based on textbook content."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5,
+        max_tokens=800
+    )
+    
+    return response.choices[0].message.content
 
 def answer_question(question):
-    """Main function to answer a question"""
-    print(f"\n🔍 Searching for: {question}")
+    """Main function to answer a question using RAG"""
+    print(f"\n🔍 Processing question...")
     
-    # Retrieve relevant chunks
-    relevant_chunks = retrieve_relevant_chunks(question, top_k=3)
+    # Retrieve relevant chunks from vector database (increased to 5 for better coverage)
+    relevant_chunks = retrieve_relevant_chunks(question, top_k=5)
     
     if not relevant_chunks:
-        print("Sorry, I couldn't find any relevant information in the textbook.")
+        print("❌ Sorry, I couldn't find any relevant information in the textbook.")
         return
     
-    print(f"✓ Found {len(relevant_chunks)} relevant passages\n")
+    print(f"✓ Retrieved {len(relevant_chunks)} relevant passages")
+    print(f"✓ Retrieved chunks {relevant_chunks}")
     
-    # Try to generate answer with LLM first
-    llm_answer = generate_answer_with_llm(question, relevant_chunks)
+    # Show which pages were referenced with relevance scores
+    pages_scores = []
+    for chunk in relevant_chunks:
+        if hasattr(chunk, 'payload'):
+            page = chunk.payload.get('page_number')
+            score = getattr(chunk, 'score', 0)
+        else:
+            page = chunk.get('page_number')
+            score = chunk.get('score', 0)
+        pages_scores.append((page, score))
     
-    if llm_answer:
-        print("📝 Answer (Generated):")
-        print(llm_answer)
-    else:
-        print("📝 Relevant Context from Textbook:")
-        local_answer = generate_answer_local(question, relevant_chunks)
-        print(local_answer)
+    print(f"📖 Top References: ", end="")
+    for page, score in pages_scores[:3]:  # Show top 3
+        print(f"Page {page} ({score:.2f}), ", end="")
+    print("\n")
     
-    print("\n" + "="*80)
+    print("🤔 Generating comprehensive answer...\n")
+    
+    # Generate answer using LLM with retrieved context
+    answer = generate_answer_with_llm(question, relevant_chunks)
+    
+    print("📝 Answer:")
+    print("="*80)
+    print(answer)
+    print("="*80)
 
 def interactive_qa():
     """Run interactive Q&A session"""
     print("\n" + "="*80)
-    print("🎓 NCERT Class 11 Physics Q&A System")
+    print("🎓 NCERT Class 11 Physics Q&A System (Powered by RAG + OpenAI)")
     print("="*80)
     print("\nAsk questions about physics topics from your textbook.")
     print("Type 'exit' or 'quit' to end the session.\n")
     
     while True:
         try:
-            question = input("❓ Your Question: ").strip()
+            question = input("\n❓ Your Question: ").strip()
             
             if question.lower() in ['exit', 'quit', 'q']:
                 print("\n👋 Thanks for using the Q&A system!")
@@ -181,9 +206,11 @@ def interactive_qa():
 if __name__ == "__main__":
     # Check if collection exists
     try:
-        qdrant_client.get_collection(COLLECTION_NAME)
+        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+        print(f"✓ Connected to collection '{COLLECTION_NAME}'")
+        print(f"✓ Total vectors: {collection_info.points_count}\n")
         interactive_qa()
     except Exception as e:
         print(f"\n❌ Collection '{COLLECTION_NAME}' not found!")
         print(f"Error: {e}")
-        print("Please run 'python ingest_pdf.py' first to ingest the PDF.\n")
+        print("\nPlease run 'python ingest_pdf.py' first to ingest the PDF.\n")

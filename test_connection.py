@@ -1,15 +1,40 @@
 """
-Test Qdrant connection
+Test Qdrant and OpenAI connections
 """
 from qdrant_client import QdrantClient
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
 
-# Connect to Qdrant
-qdrant_client = QdrantClient(
-    url="https://6e8b2b56-7e71-4cb3-8a1d-fd6149e731c3.eu-west-1-0.aws.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YzhlNmE0MDAtZTkxOC00MTFhLTlhMjQtMWNmOWYxODVhYTkzIn0.hFbR62CvPdrm79UKvfgZCB-QnLpBgMYs7SH9i8xCccE",
-)
+# Load environment variables
+load_dotenv()
 
-print("Testing Qdrant connection...")
-collections = qdrant_client.get_collections()
-print(f"✓ Connected successfully!")
-print(f"Current collections: {collections}")
+print("Testing connections...\n")
+
+# Test Qdrant connection
+print("1. Testing Qdrant connection...")
+try:
+    qdrant_client = QdrantClient(
+        url=os.getenv("QDRANT_URL"),
+        api_key=os.getenv("QDRANT_API_KEY"),
+    )
+    collections = qdrant_client.get_collections()
+    print(f"   ✓ Qdrant connected successfully!")
+    print(f"   Current collections: {collections}")
+except Exception as e:
+    print(f"   ❌ Qdrant connection failed: {e}")
+
+# Test OpenAI connection
+print("\n2. Testing OpenAI connection...")
+try:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input="test"
+    )
+    print(f"   ✓ OpenAI connected successfully!")
+    print(f"   Embedding dimension: {len(response.data[0].embedding)}")
+except Exception as e:
+    print(f"   ❌ OpenAI connection failed: {e}")
+
+print("\n✓ All tests complete!")

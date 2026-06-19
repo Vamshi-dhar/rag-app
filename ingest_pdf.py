@@ -2,23 +2,35 @@
 PDF Ingestion Script - Extracts text from PDF and stores in Qdrant
 """
 import fitz  # PyMuPDF
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import uuid
+import os
+from dotenv import load_dotenv
 
-# Initialize embedding model
-print("Loading embedding model...")
-model = SentenceTransformer('all-MiniLM-L6-v2')
+# Load environment variables
+load_dotenv()
 
-# Connect to Qdrant
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Connect to Qdrant using environment variables
 qdrant_client = QdrantClient(
-    url="https://6e8b2b56-7e71-4cb3-8a1d-fd6149e731c3.eu-west-1-0.aws.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YzhlNmE0MDAtZTkxOC00MTFhLTlhMjQtMWNmOWYxODVhYTkzIn0.hFbR62CvPdrm79UKvfgZCB-QnLpBgMYs7SH9i8xCccE",
+    url=os.getenv("QDRANT_URL"),
+    api_key=os.getenv("QDRANT_API_KEY"),
 )
 
 # Collection name
 COLLECTION_NAME = "ncert_physics_class11"
+
+def get_embedding(text):
+    """Generate embedding using OpenAI"""
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return response.data[0].embedding
 
 def extract_text_from_pdf(pdf_path):
     """Extract text from PDF page by page"""
@@ -38,26 +50,64 @@ def extract_text_from_pdf(pdf_path):
     print(f"Extracted {len(pages_content)} pages")
     return pages_content
 
-def create_chunks(pages_content, chunk_size=500, overlap=50):
-    """Split pages into smaller chunks for better retrieval"""
+def create_chunks(pages_content, chunk_size=800, overlap=200):
+    """Split pages into smaller chunks with better context preservation"""
     chunks = []
     
     for page in pages_content:
         content = page['content']
         page_num = page['page_number']
         
-        # Split content into chunks
-        words = content.split()
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk_text = ' '.join(words[i:i + chunk_size])
-            if chunk_text.strip():
+        # Split by sentences for better semantic chunking
+        sentences = content.replace('\n', ' ').split('. ')
+        
+        current_chunk = []
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            sentence_words = sentence.split()
+            sentence_length = len(sentence_words)
+            
+            # If adding this sentence exceeds chunk size, save current chunk
+            if current_length + sentence_length > chunk_size and current_chunk:
+                chunk_text = '. '.join(current_chunk) + '.'
                 chunks.append({
                     'text': chunk_text,
                     'page_number': page_num,
                     'chunk_id': len(chunks)
                 })
+                
+                # Keep last few sentences for overlap
+                overlap_sentences = []
+                overlap_length = 0
+                for s in reversed(current_chunk):
+                    s_len = len(s.split())
+                    if overlap_length + s_len <= overlap:
+                        overlap_sentences.insert(0, s)
+                        overlap_length += s_len
+                    else:
+                        break
+                
+                current_chunk = overlap_sentences
+                current_length = overlap_length
+            
+            current_chunk.append(sentence)
+            current_length += sentence_length
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunk_text = '. '.join(current_chunk) + '.'
+            chunks.append({
+                'text': chunk_text,
+                'page_number': page_num,
+                'chunk_id': len(chunks)
+            })
     
-    print(f"Created {len(chunks)} chunks")
+    print(f"Created {len(chunks)} chunks with improved semantic boundaries")
     return chunks
 
 def ingest_to_qdrant(chunks):
@@ -72,18 +122,19 @@ def ingest_to_qdrant(chunks):
         pass
     
     print(f"Creating collection '{COLLECTION_NAME}'...")
+    # OpenAI text-embedding-3-small has 1536 dimensions
     qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
     )
     
     # Prepare points for batch upload
     points = []
-    print("Generating embeddings...")
+    print("Generating embeddings using OpenAI...")
     
     for idx, chunk in enumerate(chunks):
-        # Generate embedding
-        embedding = model.encode(chunk['text']).tolist()
+        # Generate embedding using OpenAI
+        embedding = get_embedding(chunk['text'])
         
         # Create point
         point = PointStruct(
